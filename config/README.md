@@ -90,6 +90,7 @@ If you want to contribute your own configuration, please
 | log-level-dependencies | Logging level for dependencies. Possible values: "off", "error", "warn", "info", "debug", "trace". | "warn"             |                          | RUSTIC_LOG_LEVEL_DEPENDENCIES                    | --log-level-dependencies |
 | log-file               | Path to the log file.                                                                              | No log file        | "/log/rustic.log"        | RUSTIC_LOG_FILE                                  | --log-file               |
 | no-progress            | If true, disables progress indicators.                                                             | false              |                          | RUSTIC_NO_PROGRESS                               | --no-progress            |
+| json-progress          | If true, writes progress as newline-delimited JSON.                                                | false              |                          | RUSTIC_JSON_PROGRESS                             | --json-progress          |
 | progress-interval      | The interval at which progress indicators are shown.                                               | "100ms"            | "1m"                     | RUSTIC_PROGRESS_INTERVAL                         | --progress-interval      |
 | group-by               | Group snapshots by any combination of host,label,paths,tags e.g. for "latest"                      | "host,label,paths" |                          | RUSTIC_GROUP_BY                                  | --group-by, -g           |
 | check-index            | If true, check the index and read pack headers if index information is missing.                    | false              |                          | RUSTIC_CHECK_INDEX                               | --check-index            |
@@ -156,7 +157,14 @@ e.g. `use-password = "true"` becomes `RUSTIC_REPO_OPT_USE_PASSWORD=true`.
 
 Moreover, for opendal parameters (which need to be in lower snake case), you can
 use upper snake case and prefix with "OPENDAL_" as env variable, e.g.
-`application_key = "my-key"` becomes `OPENDAL_APPLICATION_KEY=my-key`.
+`application_key = "my-key"` becomes `OPENDAL_APPLICATION_KEY=my-key`. A list of
+available parameters for a backend can be found in
+[opendal's documentation](https://opendal.apache.org/docs/rust/opendal/services/index.html)
+under the respective backend's struct.
+
+Note that all values under this table must be strings, regardless of their
+logical type. For example `use-password = true` needs to be
+`use-password = "true"`.
 
 | Attribute           | Description                                                        | Default Value | Example Value                  |
 | ------------------- | ------------------------------------------------------------------ | ------------- | ------------------------------ |
@@ -269,14 +277,21 @@ See [Global Metrics labels](#global-metrics-labels-globalmetrics-labels).
 **Note**: All of the backup options mentioned before can also be used as
 snapshot-specific option and then only apply to this snapshot.
 
-| Attribute | Description                                                            | Default Value | Example Value                                                          |
-| --------- | ---------------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------- |
-| name      | Name to identify this snapshot (to be used with the --name CLI option) | ""            | "myid"                                                                 |
-| sources   | Array of source directories or file(s) to back up.                     | []            | ["/dir1", "/dir2"]                                                     |
-| hooks     | Hooks to run before and after backing up the defined sources.          | Not set       | { run-before = [], run-after = [], run-failed = [], run-finally = [] } |
+| Attribute | Description                                                                                                              | Default Value | Example Value                                                          |
+| --------- | ------------------------------------------------------------------------------------------------------------------------ | ------------- | ---------------------------------------------------------------------- |
+| name      | Name to identify this snapshot (to be used with the --name CLI option)                                                   | ""            | "myid"                                                                 |
+| sources   | Array of source directories or file(s) to back up. Allows "opendal:" for a remote source if only a single source is used | []            | ["/dir1", "/dir2"], ["opendal:s3"]                                     |
+| hooks     | Hooks to run before and after backing up the defined sources.                                                            | Not set       | { run-before = [], run-after = [], run-failed = [], run-finally = [] } |
 
 Source-specific hooks are called additionally to global, repository and backup
 hooks when backing up the defined sources into a snapshot.
+
+### Snapshot Sourcey Options `[backup.snapshots.options]`
+
+Additional source options - depending on the used source. This is currently only
+relevant for an opendal source. These can be only set in the config file.
+
+see [Repository Options](#repository-options-repository)
 
 ### Forget Options `[forget]`
 

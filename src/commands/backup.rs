@@ -5,6 +5,7 @@ use std::fmt::Display;
 use std::path::PathBuf;
 use std::{collections::BTreeMap, env};
 
+use crate::commands::ls::LsCmd;
 use crate::repository::IndexedIdsRepo;
 use crate::{
     Application, RUSTIC_APP,
@@ -21,13 +22,15 @@ use clap::ValueHint;
 use comfy_table::Cell;
 use conflate::{Merge, MergeFrom};
 use log::{debug, error, info, warn};
-use rustic_core::{Excludes, StringList};
+use rustic_backend::OpenDALBackend;
+use rustic_core::{ChildStdoutSource, Excludes, LocalSource, ReadSource, StdinSource, StringList};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use rustic_core::{
     BackupOptions, CommandInput, ConfigOptions, KeyOptions, LocalSourceFilterOptions,
-    LocalSourceSaveOptions, ParentOptions, PathList, SnapshotOptions, repofile::SnapshotFile,
+    LocalSourceSaveOptions, ParentOptions, PathList, SnapshotOptions,
+    repofile::{SnapshotFile, SnapshotId},
 };
 
 /// `backup` subcommand
@@ -53,6 +56,12 @@ pub struct BackupCmd {
     #[merge(skip)]
     #[serde(skip)]
     cli_name: Vec<String>,
+
+    /// Don't run the backup, but only list files which would be backup'ed.
+    #[clap(long)]
+    #[merge(skip)]
+    #[serde(skip)]
+    ls: bool,
 
     #[clap(skip)]
     #[merge(skip)]
@@ -143,6 +152,11 @@ pub struct BackupCmd {
     #[clap(skip)]
     #[merge(skip)]
     sources: Vec<String>,
+
+    /// Other options for this source
+    #[clap(skip)]
+    #[merge(strategy = conflate::btreemap::append_or_ignore)]
+    options: BTreeMap<String, String>,
 
     /// Job name for the metrics. Default: rustic-backup
     #[clap(long, value_name = "JOB_NAME", env = "RUSTIC_METRICS_JOB")]
@@ -326,6 +340,78 @@ impl BackupCmd {
         hooks.with_env(&hooks_variables)
     }
 
+    fn backup_source(
+        source: &PathList,
+        options: BTreeMap<String, String>,
+        ls: bool,
+        backup_opts: BackupOptions,
+        snap: &mut SnapshotFile,
+        repo: &IndexedIdsRepo,
+    ) -> Result<()> {
+        let backup_stdin = PathList::from_string("-")?;
+        let source = source
+            .clone()
+            .sanitize()
+            .with_context(|| format!("error sanitizing source=s\"{:?}\"", source))?
+            .merge();
+
+        if source.len() == 1
+                // TODO: This check should not be done on PathList, but in the sources list directly
+                && let Some(path) = source[0].to_string_lossy().strip_prefix("opendal:")
+        {
+            let source = OpenDALBackend::new(path, options)?.as_source()?;
+            Self::archive(repo, &backup_opts, ls, &source, snap, &[PathBuf::new()])?;
+        } else if source == backup_stdin {
+            let path = PathBuf::from(&backup_opts.stdin_filename);
+            let backup_paths = vec![path.clone()];
+            if let Some(command) = &backup_opts.stdin_command {
+                let src = ChildStdoutSource::new(command, path)?;
+                Self::archive(repo, &backup_opts, ls, &src, snap, &backup_paths)?;
+                src.finish()?;
+            } else {
+                let src = StdinSource::new(path);
+                Self::archive(repo, &backup_opts, ls, &src, snap, &backup_paths)?;
+            }
+        } else {
+            let backup_path = source.paths();
+            let src = LocalSource::new(
+                backup_opts.ignore_save_opts,
+                &backup_opts.excludes,
+                &backup_opts.ignore_filter_opts,
+                &backup_path,
+            )?;
+            Self::archive(repo, &backup_opts, ls, &src, snap, &backup_path)?;
+        };
+        Ok(())
+    }
+
+    pub fn archive<R>(
+        repo: &IndexedIdsRepo,
+        opts: &BackupOptions,
+        ls: bool,
+        src: &R,
+        snap: &mut SnapshotFile,
+        backup_paths: &[PathBuf],
+    ) -> Result<()>
+    where
+        R: ReadSource + 'static,
+        <R as ReadSource>::Open: Send,
+        <R as ReadSource>::Iter: Send,
+    {
+        if ls {
+            let lister = LsCmd {
+                long: true,
+                ..Default::default()
+            };
+            lister.display(src.entries().map(|e| Ok(e?.as_tree_entry())))?;
+        } else {
+            let snapshot = std::mem::take(snap);
+            let snapshot = repo.archive(opts, src, snapshot, backup_paths)?;
+            *snap = snapshot;
+        }
+        Ok(())
+    }
+
     fn backup_snapshot(mut self, source: PathList, repo: &IndexedIdsRepo) -> Result<()> {
         let config = RUSTIC_APP.config();
         let snapshot_opts = &config.backup.snapshots;
@@ -368,16 +454,16 @@ impl BackupCmd {
             .no_scan(self.no_scan)
             .dry_run(config.global.dry_run);
 
-        let snap = hooks.use_with(|| -> Result<_> {
-            let source = source
-                .clone()
-                .sanitize()
-                .with_context(|| format!("error sanitizing source=s\"{:?}\"", source))?
-                .merge();
-            Ok(repo.backup(&backup_opts, &source, self.snap_opts.to_snapshot()?)?)
+        let mut snap = self.snap_opts.to_snapshot()?;
+        hooks.use_with(|| {
+            Self::backup_source(&source, self.options, self.ls, backup_opts, &mut snap, repo)
         })?;
 
-        if self.json {
+        if self.ls {
+            // no output here
+        } else if config.global.progress_options.json_progress {
+            write_json_progress_summary(&snap)?;
+        } else if self.json {
             let mut stdout = std::io::stdout();
             serde_json::to_writer_pretty(&mut stdout, &snap)?;
         } else if self.long {
@@ -429,6 +515,53 @@ impl BackupCmd {
         info!("backup of {source} done.");
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+struct JsonProgressSummary {
+    message_type: &'static str,
+    files_new: u64,
+    files_changed: u64,
+    files_unmodified: u64,
+    dirs_new: u64,
+    dirs_changed: u64,
+    dirs_unmodified: u64,
+    data_blobs: u64,
+    tree_blobs: u64,
+    data_added: u64,
+    data_added_packed: u64,
+    total_files_processed: u64,
+    total_bytes_processed: u64,
+    total_duration: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<SnapshotId>,
+}
+
+fn write_json_progress_summary(snap: &SnapshotFile) -> Result<()> {
+    if let Some(summary) = snap.summary.as_ref() {
+        let snapshot_id = (snap.id != SnapshotId::default()).then_some(snap.id);
+        let json_rogress = JsonProgressSummary {
+            message_type: "summary",
+            files_new: summary.files_new,
+            files_changed: summary.files_changed,
+            files_unmodified: summary.files_unmodified,
+            dirs_new: summary.dirs_new,
+            dirs_changed: summary.dirs_changed,
+            dirs_unmodified: summary.dirs_unmodified,
+            data_blobs: summary.data_blobs,
+            tree_blobs: summary.tree_blobs,
+            data_added: summary.data_added,
+            data_added_packed: summary.data_added_packed,
+            total_files_processed: summary.total_files_processed,
+            total_bytes_processed: summary.total_bytes_processed,
+            total_duration: summary.total_duration,
+            snapshot_id,
+        };
+        let mut stdout = std::io::stdout();
+        serde_json::to_writer(&mut stdout, &json_rogress)?;
+        println!();
+    }
+    Ok(())
 }
 
 #[cfg(not(any(feature = "prometheus", feature = "opentelemetry")))]
